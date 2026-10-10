@@ -5,10 +5,10 @@ One 1.3 MB exe, no runtime, no admin rights. It idles at 0% CPU and a few MB of 
 
 ## Install
 
-Download `dvnote-Setup.exe` from the [latest release](https://github.com/ksanadv/dvnote/releases/latest) and run it. It
-installs for the current user, registers `.txt`, `.md` and `.markdown`, and adds a Start menu shortcut. Running it again
-updates in place, even while dvnote is open. Silent: `dvnote-Setup.exe --quiet`. Uninstall from Apps & features or
-**Help > Uninstall**.
+Download `dvnote-<version>-windows-x64-setup.exe` from the [latest release](https://github.com/ksanadv/dvnote/releases/latest)
+and run it. It installs for the current user, registers `.txt`, `.md` and `.markdown`, and adds a Start menu shortcut.
+Running it again updates in place, even while dvnote is open. Silent: add `--quiet`. Uninstall from Apps & features or
+**Help > Uninstall**. The `-portable.exe` is the same program without the installer.
 
 ## Features
 
@@ -43,7 +43,7 @@ under 0.1 ms up to 200 MB. Notepad has tabs, session restore and spell check; dv
 ## Building and releasing
 
 ```powershell
-.\build-installer.ps1             # builds dist\dvnote-Setup.exe
+.\build-installer.ps1             # builds the setup and portable exe into dist\
 .\release.ps1 -Bump 0.4.0         # sets the version in both Cargo.toml files; commit it on a branch
 .\release.ps1                     # once that is merged: tags main, and GitHub Actions publishes the release
 ```

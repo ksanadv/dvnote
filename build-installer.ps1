@@ -15,6 +15,10 @@ $env:DVNOTE_EXE = Join-Path $target 'release\dvnote.exe'
 cargo build --release --manifest-path installer/Cargo.toml --target-dir $target
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+# release asset names; src/update.rs downloads the setup by the same pattern
+$name = "dvnote-$appVersion-windows-x64"
 New-Item -ItemType Directory -Force dist | Out-Null
-Copy-Item (Join-Path $target 'release\dvnote-setup.exe') dist\dvnote-Setup.exe -Force
-Get-Item dist\dvnote-Setup.exe | ForEach-Object { '{0}  {1:N1} MB' -f $_.FullName, ($_.Length / 1MB) }
+Remove-Item dist\dvnote-* -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $target 'release\dvnote-setup.exe') "dist\$name-setup.exe"
+Copy-Item (Join-Path $target 'release\dvnote.exe') "dist\$name-portable.exe"
+Get-Item dist\$name-* | ForEach-Object { '{0}  {1:N1} MB' -f $_.FullName, ($_.Length / 1MB) }
