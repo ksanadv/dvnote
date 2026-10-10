@@ -1,33 +1,39 @@
-# Makes a release: .\release.ps1 0.4.0
-# Sets the version in both Cargo.toml files, builds and tests locally, commits, tags v0.4.0 and pushes. GitHub Actions
-# (.github/workflows/release.yml) then builds the release from the tag and publishes it.
-param([Parameter(Mandatory)][string]$Version)
+# Releases never commit to main; the version change goes through a branch like any other change.
+#   .\release.ps1 -Bump 0.4.0   sets the version in both Cargo.toml files (and their lock files) on the current branch
+#   .\release.ps1               on an up-to-date main: builds and tests, then tags v<version> and pushes only the tag.
+#                               GitHub Actions (.github/workflows/release.yml) builds and publishes the release from it.
+param([string]$Bump)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+$pattern = [regex]'(?m)^version\s*=\s*"([^"]+)"'
 
-if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Use a version like 1.2.3, not '$Version'" }
-$tag = "v$Version"
-if (git status --porcelain) { throw 'Commit or stash your changes first' }
-if (git tag --list $tag) { throw "$tag already exists" }
-$branch = git branch --show-current
-if ($branch -ne 'main') { throw "Releases are made from main, not '$branch'" }
-
-$pattern = [regex]'(?m)^version\s*=\s*"[^"]+"'
-foreach ($f in 'Cargo.toml', 'installer/Cargo.toml') {
-    $path = Join-Path $PSScriptRoot $f
-    $text = [IO.File]::ReadAllText($path)
-    [IO.File]::WriteAllText($path, $pattern.Replace($text, "version = `"$Version`"", 1))
+if ($Bump) {
+    if ($Bump -notmatch '^\d+\.\d+\.\d+$') { throw "Use a version like 1.2.3, not '$Bump'" }
+    foreach ($f in 'Cargo.toml', 'installer/Cargo.toml') {
+        $path = Join-Path $PSScriptRoot $f
+        [IO.File]::WriteAllText($path, $pattern.Replace([IO.File]::ReadAllText($path), "version = `"$Bump`"", 1))
+    }
+    # also brings both Cargo.lock files up to the new version
+    .\build-installer.ps1
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    "Version set to $Bump. Commit it on a branch and merge it, then run .\release.ps1 on main."
+    exit 0
 }
 
-# also brings both Cargo.lock files up to the new version
+$version = $pattern.Match([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Cargo.toml'))).Groups[1].Value
+$tag = "v$version"
+if ((git branch --show-current) -ne 'main') { throw 'Switch to main first' }
+if (git status --porcelain) { throw 'Commit or stash your changes first' }
+git fetch origin main --tags
+if ((git rev-parse HEAD) -ne (git rev-parse origin/main)) { throw 'main is not the same as origin/main; pull first' }
+if (git tag --list $tag) { throw "$tag already exists; bump the version with .\release.ps1 -Bump" }
+
 .\build-installer.ps1
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 cargo test --release
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-git add Cargo.toml Cargo.lock installer/Cargo.toml installer/Cargo.lock
-git commit -m "Release $tag"
-git tag -a $tag -m "dvnote $Version"
-git push origin main $tag
+git tag -a $tag -m "dvnote $version"
+git push origin $tag
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 "Pushed $tag. The release appears at https://github.com/ksanadv/dvnote/releases once the Release workflow finishes."
