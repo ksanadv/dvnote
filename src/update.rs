@@ -12,7 +12,6 @@ use windows_sys::Win32::Networking::WinHttp::*;
 
 pub const REPO: &str = "ksanadv/dvnote";
 const HOST: &str = "github.com";
-const SETUP: &str = "dvnote-Setup.exe";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 // the status bar reminder turns yellow when nothing has been checked for about six months
 const REMIND_AFTER: Duration = Duration::from_secs(182 * 24 * 3600);
@@ -86,7 +85,8 @@ pub fn latest() -> Result<Latest, String> {
 // downloads the release's setup program, checks it against the published SHA-256 and runs it silently; the running copy
 // keeps working and the new version starts the next time dvnote is opened
 pub fn install(version: &str) -> Result<(), String> {
-    let base = format!("/{REPO}/releases/download/v{version}/{SETUP}");
+    let name = setup_name(version);
+    let base = format!("/{REPO}/releases/download/v{version}/{name}");
     let setup = Request::get(&base, true)?.body("the update")?;
     let sums = Request::get(&format!("{base}.sha256"), true)?.body("the update's checksum")?;
     let expected = parse_sha256(&String::from_utf8_lossy(&sums)).ok_or("The update's checksum file is not valid.")?;
@@ -94,7 +94,7 @@ pub fn install(version: &str) -> Result<(), String> {
         return Err("The downloaded update does not match its published checksum, so it was not installed.".into());
     }
     let dir = std::env::temp_dir().join("dvnote-update");
-    let exe = dir.join(SETUP);
+    let exe = dir.join(&name);
     std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::write(&exe, &setup))
         .map_err(|e| format!("Cannot save the update: {e}"))?;
@@ -105,6 +105,11 @@ pub fn install(version: &str) -> Result<(), String> {
         Ok(s) => Err(format!("The setup program failed ({s}).")),
         Err(e) => Err(format!("Cannot run the setup program: {e}")),
     }
+}
+
+// the release asset name; build-installer.ps1 and the Release workflow use the same pattern
+fn setup_name(version: &str) -> String {
+    format!("dvnote-{version}-windows-x64-setup.exe")
 }
 
 fn version_from_location(location: &str) -> Option<String> {
@@ -262,10 +267,10 @@ mod tests {
     fn checksum_file() {
         let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let empty = sha256(b"").unwrap();
-        assert_eq!(parse_sha256(&format!("{hex}  dvnote-Setup.exe\n")), Some(empty));
+        assert_eq!(parse_sha256(&format!("{hex}  dvnote-1.2.3-windows-x64-setup.exe\n")), Some(empty));
         assert_eq!(parse_sha256(&hex.to_uppercase()), Some(empty));
-        assert_eq!(parse_sha256(&format!("\u{feff}{hex}  dvnote-Setup.exe")), Some(empty));
-        assert_eq!(parse_sha256("abc  dvnote-Setup.exe"), None);
+        assert_eq!(parse_sha256(&format!("\u{feff}{hex}  dvnote-1.2.3-windows-x64-setup.exe")), Some(empty));
+        assert_eq!(parse_sha256("abc  dvnote-1.2.3-windows-x64-setup.exe"), None);
         assert_eq!(parse_sha256(""), None);
     }
 }
