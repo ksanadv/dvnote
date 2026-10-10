@@ -103,6 +103,7 @@ impl Preview {
 
     // drop everything derived from the document while the preview is hidden
     pub fn release(&mut self) {
+        self.canvas.release();
         if self.blocks.is_empty() && self.laid.is_empty() {
             return;
         }

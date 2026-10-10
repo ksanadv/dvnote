@@ -3,32 +3,34 @@
 use crate::editor::{LineLayout, Metrics, Piece};
 use crate::utf16::Utf16Map;
 use std::any::Any;
+use std::ffi::c_void;
 use std::rc::Rc;
-use windows::core::{w, Result, HRESULT, PCWSTR};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_UNKNOWN;
-use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
-use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
-};
+use windows::core::{implement, w, IUnknown, Interface, Ref, Result, BOOL, HRESULT, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_HIT_TEST_METRICS,
-    DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
+    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteGdiInterop, IDWriteInlineObject,
+    IDWritePixelSnapping_Impl, IDWriteRenderingParams, IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer,
+    IDWriteTextRenderer_Impl, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_HIT_TEST_METRICS,
+    DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_MATRIX, DWRITE_MEASURING_MODE,
+    DWRITE_READING_DIRECTION, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT, DWRITE_STRIKETHROUGH, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
-use windows_numerics::Vector2;
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, GdiFlush, GetCurrentObject, GetDC, GetObjectW, ReleaseDC, SetPixelV, DIBSECTION, HDC, OBJ_BITMAP, SRCCOPY,
+};
 
 #[derive(Clone, Copy)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    pub fn d2d(self, a: f32) -> D2D1_COLOR_F {
-        D2D1_COLOR_F { r: self.0 as f32 / 255.0, g: self.1 as f32 / 255.0, b: self.2 as f32 / 255.0, a }
+    // the layout of a 32-bit DIB pixel: blue in the low byte
+    fn pixel(self) -> u32 {
+        (self.0 as u32) << 16 | (self.1 as u32) << 8 | self.2 as u32
+    }
+
+    fn colorref(self) -> COLORREF {
+        COLORREF(self.0 as u32 | (self.1 as u32) << 8 | (self.2 as u32) << 16)
     }
 }
 
@@ -108,17 +110,23 @@ impl Theme {
 
 const E_NOT_SUFFICIENT_BUFFER: HRESULT = HRESULT(0x8007007Au32 as i32);
 
+// DirectWrite only: it shapes text and rasterizes glyphs into our own bitmaps (see Canvas). There is no Direct2D, so
+// no Direct3D device, WARP rasterizer or swap buffers are created.
 pub struct Gfx {
     pub dwrite: IDWriteFactory,
-    pub d2d: ID2D1Factory,
+    interop: IDWriteGdiInterop,
+    // ClearType and gamma as the user configured them
+    params: IDWriteRenderingParams,
+    renderer: IDWriteTextRenderer,
 }
 
 impl Gfx {
     pub fn new() -> Result<Rc<Gfx>> {
         unsafe {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            Ok(Rc::new(Gfx { dwrite, d2d }))
+            let interop = dwrite.GetGdiInterop()?;
+            let params = dwrite.CreateRenderingParams()?;
+            Ok(Rc::new(Gfx { dwrite, interop, params, renderer: GlyphSink.into() }))
         }
     }
 
@@ -243,10 +251,6 @@ impl DwPiece {
     fn row_of(&self, col: usize) -> usize {
         self.starts.partition_point(|&s| s <= col).saturating_sub(1)
     }
-
-    pub fn draw(&self, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, x: f32, y: f32) {
-        unsafe { rt.DrawTextLayout(Vector2 { X: x, Y: y }, &self.layout, brush, D2D1_DRAW_TEXT_OPTIONS_NONE) };
-    }
 }
 
 impl Piece for DwPiece {
@@ -322,17 +326,129 @@ impl Piece for DwPiece {
     }
 }
 
+// A window's back buffer: a 32-bit DIB that DirectWrite draws glyphs into and that rectangles are written into directly,
+// then copied to the window in one BitBlt. It is the only pixel memory the editor holds.
+struct Surface {
+    target: IDWriteBitmapRenderTarget,
+    dc: HDC,
+    bits: *mut u32,
+    w: usize,
+    h: usize,
+    // pixels per row
+    stride: usize,
+    top_down: bool,
+}
+
+impl Surface {
+    fn new(gfx: &Gfx, w: u32, h: u32) -> Option<Surface> {
+        let target = unsafe { gfx.interop.CreateBitmapRenderTarget(None, w, h).ok()? };
+        // it defaults to the screen's DPI, but layouts are already sized in pixels
+        unsafe { target.SetPixelsPerDip(1.0).ok()? };
+        let mut s = Surface {
+            dc: unsafe { target.GetMemoryDC() },
+            target,
+            bits: std::ptr::null_mut(),
+            w: 0,
+            h: 0,
+            stride: 0,
+            top_down: true,
+        };
+        s.locate().then_some(s)
+    }
+
+    fn resize(&mut self, w: u32, h: u32) -> bool {
+        unsafe { self.target.Resize(w, h).is_ok() && self.locate() }
+    }
+
+    // finds the DIB's pixels; DirectWrite replaces the bitmap on every resize
+    fn locate(&mut self) -> bool {
+        unsafe {
+            self.dc = self.target.GetMemoryDC();
+            let bitmap = GetCurrentObject(self.dc, OBJ_BITMAP);
+            let mut ds = DIBSECTION::default();
+            let n =
+                GetObjectW(bitmap, std::mem::size_of::<DIBSECTION>() as i32, Some(&mut ds as *mut _ as *mut c_void));
+            if n as usize != std::mem::size_of::<DIBSECTION>() || ds.dsBm.bmBits.is_null() || ds.dsBm.bmBitsPixel != 32
+            {
+                return false;
+            }
+            self.bits = ds.dsBm.bmBits as *mut u32;
+            self.w = ds.dsBm.bmWidth as usize;
+            self.h = ds.dsBm.bmHeight.unsigned_abs() as usize;
+            self.stride = ds.dsBm.bmWidthBytes as usize / 4;
+            // the header does not reliably report the row order, so ask GDI to set the top-left pixel and look
+            let probe = Rgb(1, 2, 3);
+            let _ = SetPixelV(self.dc, 0, 0, probe.colorref());
+            let _ = GdiFlush();
+            self.top_down = *self.bits & 0xFF_FFFF == probe.pixel();
+        }
+        true
+    }
+
+    fn row(&self, y: usize) -> &mut [u32] {
+        let y = if self.top_down { y } else { self.h - 1 - y };
+        // SAFETY: y < h and the DIB holds h rows of `stride` pixels; the surface is only touched on the UI thread
+        unsafe { std::slice::from_raw_parts_mut(self.bits.add(y * self.stride), self.w) }
+    }
+
+    fn clear(&self, c: Rgb) {
+        let p = c.pixel();
+        for y in 0..self.h {
+            self.row(y).fill(p);
+        }
+    }
+
+    // an axis-aligned rectangle with antialiased edges: partly covered edge pixels are blended by their coverage
+    fn fill(&self, x: f32, y: f32, w: f32, h: f32, c: Rgb) {
+        let (x0, x1) = (x.max(0.0), (x + w).min(self.w as f32));
+        let (y0, y1) = (y.max(0.0), (y + h).min(self.h as f32));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (p, solid) = (c.pixel(), |a: f32, b: f32, i: usize| (b.min(i as f32 + 1.0) - a.max(i as f32)).max(0.0));
+        let (cx0, cx1) = (x0.floor() as usize, (x1.ceil() as usize).min(self.w));
+        // whole pixels between the partly covered edge columns
+        let (ix0, ix1) = (x0.ceil() as usize, (x1.floor() as usize).max(x0.ceil() as usize));
+        for py in y0.floor() as usize..(y1.ceil() as usize).min(self.h) {
+            let cy = solid(y0, y1, py);
+            let row = self.row(py);
+            if cy >= 0.999 && ix1 > ix0 {
+                row[ix0..ix1].fill(p);
+                for px in (cx0..ix0).chain(ix1..cx1) {
+                    blend(&mut row[px], p, solid(x0, x1, px));
+                }
+            } else {
+                for px in cx0..cx1 {
+                    blend(&mut row[px], p, cy * solid(x0, x1, px));
+                }
+            }
+        }
+    }
+}
+
+fn blend(dst: &mut u32, src: u32, a: f32) {
+    if a >= 0.999 {
+        *dst = src;
+        return;
+    }
+    let a = (a * 256.0) as u32;
+    let mix = |shift: u32| {
+        let (d, s) = ((*dst >> shift) & 0xFF, (src >> shift) & 0xFF);
+        ((d * (256 - a) + s * a) >> 8) << shift
+    };
+    *dst = mix(16) | mix(8) | mix(0);
+}
+
 pub struct Canvas {
     gfx: Rc<Gfx>,
     hwnd: HWND,
-    rt: Option<ID2D1HwndRenderTarget>,
-    brush: Option<ID2D1SolidColorBrush>,
+    surface: Option<Surface>,
     size: (u32, u32),
 }
 
 impl Canvas {
     pub fn new(gfx: Rc<Gfx>, hwnd: HWND) -> Self {
-        Canvas { gfx, hwnd, rt: None, brush: None, size: (0, 0) }
+        Canvas { gfx, hwnd, surface: None, size: (0, 0) }
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -341,80 +457,68 @@ impl Canvas {
             return;
         }
         self.size = size;
-        if let Some(rt) = &self.rt {
-            unsafe {
-                let _ = rt.Resize(&D2D_SIZE_U { width: self.size.0, height: self.size.1 });
+        if let Some(s) = &mut self.surface {
+            if !s.resize(size.0, size.1) {
+                self.surface = None;
             }
         }
     }
 
-    fn ensure(&mut self) -> Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)> {
-        if self.rt.is_none() {
-            let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_UNKNOWN, alphaMode: D2D1_ALPHA_MODE_UNKNOWN },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: Default::default(),
-            };
-            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                hwnd: self.hwnd,
-                pixelSize: D2D_SIZE_U { width: self.size.0, height: self.size.1 },
-                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-            };
-            let rt = unsafe { self.gfx.d2d.CreateHwndRenderTarget(&props, &hwnd_props).ok()? };
-            let brush = unsafe { rt.CreateSolidColorBrush(&Rgb(0, 0, 0).d2d(1.0), None).ok()? };
-            unsafe { rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE) };
-            self.rt = Some(rt);
-            self.brush = Some(brush);
-        }
-        Some((self.rt.clone()?, self.brush.clone()?))
+    // frees the back buffer, for a pane that is hidden
+    pub fn release(&mut self) {
+        self.surface = None;
     }
 
     pub fn paint(&mut self, bg: Rgb, f: impl FnOnce(&Pen)) {
-        let Some((rt, brush)) = self.ensure() else { return };
-        unsafe {
-            rt.BeginDraw();
-            rt.Clear(Some(&bg.d2d(1.0)));
+        if self.surface.is_none() {
+            self.surface = Surface::new(&self.gfx, self.size.0.max(1), self.size.1.max(1));
         }
-        f(&Pen { rt: &rt, brush: &brush });
-        let result = unsafe { rt.EndDraw(None, None) };
-        if result.is_err() {
-            // device lost or target invalid: rebuild on the next paint
-            self.rt = None;
-            self.brush = None;
+        let Some(s) = &self.surface else { return };
+        s.clear(bg);
+        f(&Pen { gfx: &self.gfx, surface: s });
+        unsafe {
+            let dc = GetDC(Some(self.hwnd));
+            let _ = BitBlt(dc, 0, 0, s.w as i32, s.h as i32, Some(s.dc), 0, 0, SRCCOPY);
+            ReleaseDC(Some(self.hwnd), dc);
         }
     }
 }
 
 pub struct Pen<'a> {
-    rt: &'a ID2D1HwndRenderTarget,
-    brush: &'a ID2D1SolidColorBrush,
+    gfx: &'a Gfx,
+    surface: &'a Surface,
+}
+
+// what a layout's Draw call hands to the glyph sink
+struct DrawContext<'a> {
+    surface: &'a Surface,
+    params: &'a IDWriteRenderingParams,
+    color: Rgb,
+    link: Rgb,
 }
 
 impl Pen<'_> {
     pub fn rect(&self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
-        unsafe {
-            self.brush.SetColor(&color.d2d(1.0));
-            self.rt.FillRectangle(&D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h }, self.brush);
-        }
+        self.surface.fill(x, y, w, h, color);
     }
 
+    // only horizontal and vertical lines are drawn
     pub fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb) {
-        unsafe {
-            self.brush.SetColor(&color.d2d(1.0));
-            self.rt.DrawLine(Vector2 { X: x0, Y: y0 }, Vector2 { X: x1, Y: y1 }, self.brush, width, None);
+        let half = width / 2.0;
+        if x0 == x1 {
+            self.surface.fill(x0 - half, y0.min(y1), width, (y1 - y0).abs(), color);
+        } else {
+            self.surface.fill(x0.min(x1), y0 - half, (x1 - x0).abs(), width, color);
         }
     }
 
     pub fn piece(&self, piece: &dyn Piece, x: f32, y: f32, color: Rgb) {
         if let Some(p) = piece.as_any().downcast_ref::<DwPiece>() {
-            unsafe { self.brush.SetColor(&color.d2d(1.0)) };
-            p.draw(self.rt, self.brush, x, y);
+            self.text(&p.layout, x, y, color, color);
         }
     }
 
+    // links are marked with a drawing effect; any non-null effect means "draw in the link color"
     pub fn layout_links(
         &self,
         layout: &IDWriteTextLayout,
@@ -424,17 +528,114 @@ impl Pen<'_> {
         links: &[(u32, u32)],
         link_color: Rgb,
     ) {
-        unsafe {
-            if !links.is_empty() {
-                if let Ok(b) = self.rt.CreateSolidColorBrush(&link_color.d2d(1.0), None) {
-                    for (start, len) in links {
-                        let _ = layout.SetDrawingEffect(&b, DWRITE_TEXT_RANGE { startPosition: *start, length: *len });
-                    }
-                }
+        if !links.is_empty() {
+            let marker: IUnknown = self.gfx.params.cast().expect("IUnknown");
+            for (start, len) in links {
+                let _ = unsafe {
+                    layout.SetDrawingEffect(&marker, DWRITE_TEXT_RANGE { startPosition: *start, length: *len })
+                };
             }
-            self.brush.SetColor(&color.d2d(1.0));
-            self.rt.DrawTextLayout(Vector2 { X: x, Y: y }, layout, self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
+        self.text(layout, x, y, color, link_color);
+    }
+
+    fn text(&self, layout: &IDWriteTextLayout, x: f32, y: f32, color: Rgb, link: Rgb) {
+        let ctx = DrawContext { surface: self.surface, params: &self.gfx.params, color, link };
+        let _ = unsafe { layout.Draw(Some(&ctx as *const DrawContext as *const c_void), &self.gfx.renderer, x, y) };
+    }
+}
+
+// receives the glyph runs and decorations of a layout and puts them on the surface in the DrawContext
+#[implement(IDWriteTextRenderer)]
+struct GlyphSink;
+
+unsafe fn context<'a>(p: *const c_void) -> &'a DrawContext<'a> {
+    &*(p as *const DrawContext)
+}
+
+fn decoration(
+    ctx: &DrawContext,
+    x: f32,
+    y: f32,
+    width: f32,
+    offset: f32,
+    thick: f32,
+    dir: DWRITE_READING_DIRECTION,
+    effect: bool,
+) {
+    let x = if dir == DWRITE_READING_DIRECTION_RIGHT_TO_LEFT { x - width } else { x };
+    ctx.surface.fill(x, y + offset, width, thick.max(1.0), if effect { ctx.link } else { ctx.color });
+}
+
+impl IDWritePixelSnapping_Impl for GlyphSink_Impl {
+    fn IsPixelSnappingDisabled(&self, _: *const c_void) -> Result<BOOL> {
+        Ok(false.into())
+    }
+
+    fn GetCurrentTransform(&self, _: *const c_void, transform: *mut DWRITE_MATRIX) -> Result<()> {
+        unsafe { *transform = DWRITE_MATRIX { m11: 1.0, m12: 0.0, m21: 0.0, m22: 1.0, dx: 0.0, dy: 0.0 } };
+        Ok(())
+    }
+
+    // layouts are already sized in pixels
+    fn GetPixelsPerDip(&self, _: *const c_void) -> Result<f32> {
+        Ok(1.0)
+    }
+}
+
+impl IDWriteTextRenderer_Impl for GlyphSink_Impl {
+    fn DrawGlyphRun(
+        &self,
+        ctx: *const c_void,
+        x: f32,
+        y: f32,
+        mode: DWRITE_MEASURING_MODE,
+        run: *const DWRITE_GLYPH_RUN,
+        _: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        effect: Ref<IUnknown>,
+    ) -> Result<()> {
+        let ctx = unsafe { context(ctx) };
+        let color = if effect.is_null() { ctx.color } else { ctx.link };
+        unsafe { ctx.surface.target.DrawGlyphRun(x, y, mode, run, ctx.params, color.colorref(), None) }
+    }
+
+    fn DrawUnderline(
+        &self,
+        ctx: *const c_void,
+        x: f32,
+        y: f32,
+        u: *const DWRITE_UNDERLINE,
+        effect: Ref<IUnknown>,
+    ) -> Result<()> {
+        let (ctx, u) = unsafe { (context(ctx), &*u) };
+        decoration(ctx, x, y, u.width, u.offset, u.thickness, u.readingDirection, !effect.is_null());
+        Ok(())
+    }
+
+    fn DrawStrikethrough(
+        &self,
+        ctx: *const c_void,
+        x: f32,
+        y: f32,
+        s: *const DWRITE_STRIKETHROUGH,
+        effect: Ref<IUnknown>,
+    ) -> Result<()> {
+        let (ctx, s) = unsafe { (context(ctx), &*s) };
+        decoration(ctx, x, y, s.width, s.offset, s.thickness, s.readingDirection, !effect.is_null());
+        Ok(())
+    }
+
+    fn DrawInlineObject(
+        &self,
+        _: *const c_void,
+        _: f32,
+        _: f32,
+        _: Ref<IDWriteInlineObject>,
+        _: BOOL,
+        _: BOOL,
+        _: Ref<IUnknown>,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
