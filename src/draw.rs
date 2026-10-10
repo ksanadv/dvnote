@@ -3,6 +3,7 @@
 use crate::editor::{LineLayout, Metrics, Piece};
 use crate::utf16::Utf16Map;
 use std::any::Any;
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
 use windows::core::{implement, w, IUnknown, Interface, Ref, Result, BOOL, HRESULT, PCWSTR};
@@ -13,8 +14,8 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextRenderer_Impl, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_HIT_TEST_METRICS,
     DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_MATRIX, DWRITE_MEASURING_MODE,
-    DWRITE_READING_DIRECTION, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT, DWRITE_STRIKETHROUGH, DWRITE_TEXT_METRICS,
-    DWRITE_TEXT_RANGE, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
+    DWRITE_READING_DIRECTION_RIGHT_TO_LEFT, DWRITE_STRIKETHROUGH, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE,
+    DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, GdiFlush, GetCurrentObject, GetDC, GetObjectW, ReleaseDC, SetPixelV, DIBSECTION, HDC, OBJ_BITMAP, SRCCOPY,
@@ -385,16 +386,18 @@ impl Surface {
         true
     }
 
-    fn row(&self, y: usize) -> &mut [u32] {
+    // Cells, because DirectWrite writes the same pixels through the memory DC while we hold `&self`
+    fn row(&self, y: usize) -> &[Cell<u32>] {
         let y = if self.top_down { y } else { self.h - 1 - y };
-        // SAFETY: y < h and the DIB holds h rows of `stride` pixels; the surface is only touched on the UI thread
-        unsafe { std::slice::from_raw_parts_mut(self.bits.add(y * self.stride), self.w) }
+        // SAFETY: y < h and the DIB holds h rows of `stride` pixels; Cell<u32> has the layout of u32, and the surface
+        // is only used on the UI thread
+        unsafe { std::slice::from_raw_parts(self.bits.add(y * self.stride) as *const Cell<u32>, self.w) }
     }
 
     fn clear(&self, c: Rgb) {
         let p = c.pixel();
         for y in 0..self.h {
-            self.row(y).fill(p);
+            self.row(y).iter().for_each(|px| px.set(p));
         }
     }
 
@@ -413,30 +416,30 @@ impl Surface {
             let cy = solid(y0, y1, py);
             let row = self.row(py);
             if cy >= 0.999 && ix1 > ix0 {
-                row[ix0..ix1].fill(p);
+                row[ix0..ix1].iter().for_each(|px| px.set(p));
                 for px in (cx0..ix0).chain(ix1..cx1) {
-                    blend(&mut row[px], p, solid(x0, x1, px));
+                    blend(&row[px], p, solid(x0, x1, px));
                 }
             } else {
                 for px in cx0..cx1 {
-                    blend(&mut row[px], p, cy * solid(x0, x1, px));
+                    blend(&row[px], p, cy * solid(x0, x1, px));
                 }
             }
         }
     }
 }
 
-fn blend(dst: &mut u32, src: u32, a: f32) {
+fn blend(dst: &Cell<u32>, src: u32, a: f32) {
     if a >= 0.999 {
-        *dst = src;
+        dst.set(src);
         return;
     }
-    let a = (a * 256.0) as u32;
+    let (a, d) = ((a * 256.0) as u32, dst.get());
     let mix = |shift: u32| {
-        let (d, s) = ((*dst >> shift) & 0xFF, (src >> shift) & 0xFF);
+        let (d, s) = ((d >> shift) & 0xFF, (src >> shift) & 0xFF);
         ((d * (256 - a) + s * a) >> 8) << shift
     };
-    *dst = mix(16) | mix(8) | mix(0);
+    dst.set(mix(16) | mix(8) | mix(0));
 }
 
 pub struct Canvas {
@@ -553,17 +556,8 @@ unsafe fn context<'a>(p: *const c_void) -> &'a DrawContext<'a> {
     &*(p as *const DrawContext)
 }
 
-fn decoration(
-    ctx: &DrawContext,
-    x: f32,
-    y: f32,
-    width: f32,
-    offset: f32,
-    thick: f32,
-    dir: DWRITE_READING_DIRECTION,
-    effect: bool,
-) {
-    let x = if dir == DWRITE_READING_DIRECTION_RIGHT_TO_LEFT { x - width } else { x };
+// DirectWrite gives the left end of an underline or strikethrough, in right-to-left runs too
+fn decoration(ctx: &DrawContext, x: f32, y: f32, width: f32, offset: f32, thick: f32, effect: bool) {
     ctx.surface.fill(x, y + offset, width, thick.max(1.0), if effect { ctx.link } else { ctx.color });
 }
 
@@ -608,7 +602,7 @@ impl IDWriteTextRenderer_Impl for GlyphSink_Impl {
         effect: Ref<IUnknown>,
     ) -> Result<()> {
         let (ctx, u) = unsafe { (context(ctx), &*u) };
-        decoration(ctx, x, y, u.width, u.offset, u.thickness, u.readingDirection, !effect.is_null());
+        decoration(ctx, x, y, u.width, u.offset, u.thickness, !effect.is_null());
         Ok(())
     }
 
@@ -621,7 +615,7 @@ impl IDWriteTextRenderer_Impl for GlyphSink_Impl {
         effect: Ref<IUnknown>,
     ) -> Result<()> {
         let (ctx, s) = unsafe { (context(ctx), &*s) };
-        decoration(ctx, x, y, s.width, s.offset, s.thickness, s.readingDirection, !effect.is_null());
+        decoration(ctx, x, y, s.width, s.offset, s.thickness, !effect.is_null());
         Ok(())
     }
 
