@@ -800,7 +800,7 @@ impl App {
             let _ = GetCursorPos(&mut pt);
             let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.prev, &mut pt);
         }
-        self.preview.link_at(pt.x as f32, pt.y as f32)
+        self.preview.link_at(pt.x as f32, pt.y as f32).filter(|u| is_web_link(u))
     }
 
     fn canvas_resize(&mut self) {
@@ -881,6 +881,13 @@ impl App {
         }
         self.status_parts.iter().find(|(r, _)| x >= r.left - 8 && x <= r.right + 8).map(|(_, id)| *id)
     }
+}
+
+// links are handed to ShellExecute, so a relative or file: link in a downloaded document could start a program next to
+// it; only web and mail links are opened
+fn is_web_link(url: &str) -> bool {
+    let u = url.trim().to_ascii_lowercase();
+    ["https://", "http://", "mailto:"].iter().any(|s| u.starts_with(s))
 }
 
 fn colorref(c: Rgb) -> COLORREF {
@@ -2011,5 +2018,21 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
         }
         let _ = DestroyAcceleratorTable(accel);
         let _ = DeleteObject(bg.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_web_links_open() {
+        use super::is_web_link;
+        assert!(is_web_link("https://example.com"));
+        assert!(is_web_link(" HTTP://example.com"));
+        assert!(is_web_link("mailto:someone@example.com"));
+        for bad in
+            ["setup.exe", "file:///C:/Windows/System32/calc.exe", r"C:\x.bat", r"\\host\share\x.exe", "ms-settings:"]
+        {
+            assert!(!is_web_link(bad), "{bad}");
+        }
     }
 }
