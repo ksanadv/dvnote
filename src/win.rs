@@ -85,6 +85,8 @@ const BLINK_TIMER: usize = 1;
 // 10 half-second blinks, then the caret stays solid and the timer stops
 const BLINK_LIMIT: u32 = 10;
 const PREVIEW_TIMER: usize = 2;
+// one-shot, a few seconds after the window appears: trims a window that never got focus and so never blinked
+const IDLE_TIMER: usize = 3;
 const PREVIEW_MAX_CHARS: usize = 1_000_000;
 
 pub struct App {
@@ -353,7 +355,8 @@ impl App {
         }
     }
 
-    fn blink_tick(&mut self) {
+    // true when the caret has stopped blinking and the window is idle
+    fn blink_tick(&mut self) -> bool {
         self.blink_ticks += 1;
         if self.blink_ticks >= BLINK_LIMIT {
             // idle: leave the caret solid so the window does nothing until the next input
@@ -362,9 +365,10 @@ impl App {
             unsafe {
                 let _ = KillTimer(Some(self.edit), BLINK_TIMER);
             }
-            trim_working_set();
+            true
         } else {
             self.caret_on = !self.caret_on;
+            false
         }
     }
 
@@ -1448,6 +1452,12 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             WM_TIMER => {
                 if wp.0 == PREVIEW_TIMER {
                     with_app(|a| a.preview_timer());
+                } else if wp.0 == IDLE_TIMER {
+                    let _ = KillTimer(Some(hwnd), IDLE_TIMER);
+                    // a blinking caret trims by itself when it stops
+                    if with_app(|a| a.blink_running) == Some(false) {
+                        trim_after_paint(hwnd);
+                    }
                 }
                 LRESULT(0)
             }
@@ -1656,13 +1666,16 @@ extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 } else {
                     let _ = KillTimer(Some(hwnd), BLINK_TIMER);
                     with_app(|a| a.blink_running = false);
-                    trim_working_set();
+                    trim_after_paint(hwnd);
                 }
                 LRESULT(0)
             }
             WM_TIMER => {
-                with_app(|a| a.blink_tick());
+                let idle = with_app(|a| a.blink_tick()) == Some(true);
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                if idle {
+                    trim_after_paint(hwnd);
+                }
                 LRESULT(0)
             }
             WM_SETCURSOR if loword(lp.0 as usize) as u32 == HTCLIENT => {
@@ -1692,6 +1705,27 @@ extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
+}
+
+// paints everything pending in the window and its panes first, so the trim is not undone by the repaint that follows it
+fn trim_after_paint(hwnd: HWND) {
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let _ = windows::Win32::Graphics::Gdi::RedrawWindow(
+            Some(root),
+            None,
+            None,
+            windows::Win32::Graphics::Gdi::RDW_UPDATENOW | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
+        );
+    }
+    // the screen keeps what was painted; the back buffers are rebuilt by the next paint
+    with_app(|a| {
+        a.canvas.release();
+        a.preview.release_surface();
+    });
+    trim_working_set();
+    crate::trace::mark("idle trim");
+    crate::trace::flush();
 }
 
 // moves the process's resident pages to the standby list; they come back on demand, so an idle editor holds little RAM
@@ -1934,6 +1968,9 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
         RegisterClassExW(&wc_prev);
 
         let (w0, h0) = (settings.window_size[0] as i32, settings.window_size[1] as i32);
+        crate::trace::mark("classes registered");
+        let menu = build_menu();
+        crate::trace::mark("menu built");
         let main = CreateWindowExW(
             WS_EX_ACCEPTFILES,
             main_class,
@@ -1944,11 +1981,12 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
             w0,
             h0,
             None,
-            Some(build_menu()),
+            Some(menu),
             Some(hinst.into()),
             None,
         )
         .unwrap();
+        crate::trace::mark("main window created");
         let edit = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             edit_class,
@@ -1979,10 +2017,14 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
             None,
         )
         .unwrap();
+        crate::trace::mark("child windows created");
         apply_window_theme(main, edit, prev, &theme, settings.theme, false);
+        crate::trace::mark("windows created");
 
         let gfx = Gfx::new().expect("DirectWrite / Direct2D unavailable");
+        crate::trace::mark("gfx created");
         let app = App::new(main, edit, prev, gfx, settings).expect("fonts");
+        crate::trace::mark("app created");
         let wrap = app.settings.wrap;
         APP_CELL.with(|c| *c.borrow_mut() = Some(app));
         let _ = ShowScrollBar(edit, SB_HORZ, !wrap);
@@ -1991,6 +2033,7 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
             let loaded = handle.join().unwrap_or_else(|_| Err("The file could not be read.".to_owned()));
             report(with_app(|a| loaded.and_then(|l| a.open(&p, l))));
         }
+        crate::trace::mark("file opened");
         with_app(|a| a.refresh());
         // draw the first frame before the window appears, so it never shows blank
         with_app(|a| {
@@ -1999,8 +2042,13 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
                 a.paint_preview();
             }
         });
+        crate::trace::mark("first frame drawn");
         let _ = ShowWindow(main, SW_SHOW);
+        crate::trace::mark("ShowWindow returned");
         let _ = SetFocus(Some(edit));
+        SetTimer(Some(main), IDLE_TIMER, 6000, None);
+        crate::trace::mark("shown");
+        crate::trace::flush();
 
         dialogs::register_messages();
         let accel = accelerators();

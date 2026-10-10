@@ -17,17 +17,17 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
     "Win32_Security_Cryptography",
+    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
-windows-numerics = "0.3"
+# for the #[implement] macro (DirectWrite text renderer in draw.rs)
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
-    "Win32_Graphics_Direct2D",
-    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
@@ -41,6 +41,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[features]
+# startup phase timing written to %TEMP%\dvnote-trace.txt (see src/trace.rs)
+trace = []
 
 [build-dependencies]
 embed-resource = "3.0.12"

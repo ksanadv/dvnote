@@ -246,14 +246,13 @@ impl Editor {
     fn rebuild_rows(&mut self, buf: &Buffer) {
         let n = buf.len_lines();
         // without wrapping every line starts as one row; a long line learns its piece count when first laid out
-        let rows = if self.cols == 0 {
-            vec![1; n]
+        self.rows = if self.cols == 0 {
+            RowIndex::uniform(n, 1)
         } else if buf.text.is_mapped() || buf.len_chars() > UNIFORM_ESTIMATE_CHARS {
-            vec![self.estimate_piece(buf.len_chars() / n); n]
+            RowIndex::uniform(n, self.estimate_piece(buf.len_chars() / n))
         } else {
-            (0..n).map(|i| self.estimate_line(buf.line_len(i))).collect()
+            RowIndex::new((0..n).map(|i| self.estimate_line(buf.line_len(i))).collect())
         };
-        self.rows = RowIndex::new(rows);
         self.cache.clear();
         self.seg_rows.clear();
     }

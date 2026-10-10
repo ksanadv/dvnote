@@ -17,6 +17,7 @@ mod rowindex;
 mod settings;
 mod sys;
 mod text;
+mod trace;
 mod update;
 mod utf16;
 mod win;
@@ -40,6 +41,7 @@ fn cli(result: Result<String, String>) -> ! {
 }
 
 fn main() {
+    trace::mark("main");
     std::thread::spawn(draw::warm_up);
     std::panic::set_hook(Box::new(|info| {
         sys::show_fatal(&format!("{APP} hit an internal error and must close.\n\n{info}"));

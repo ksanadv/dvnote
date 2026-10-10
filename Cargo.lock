@@ -77,7 +77,7 @@ dependencies = [
  "rfd",
  "ropey",
  "windows",
- "windows-numerics",
+ "windows-core",
  "windows-sys",
  "winreg",
 ]

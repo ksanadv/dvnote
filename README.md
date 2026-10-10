@@ -1,7 +1,8 @@
 # dvnote
 
-A small Notepad-style editor for `.txt` and `.md` files, written in Rust on plain Win32 with Direct2D and DirectWrite.
-One 1.3 MB exe, no runtime, no admin rights. It idles at 0% CPU and a few MB of RAM, and opens a 55 MB file in about 140 ms.
+A small Notepad-style editor for `.txt` and `.md` files, written in Rust on plain Win32 and DirectWrite.
+One 1.3 MB exe, no runtime, no admin rights. It idles at 0% CPU and about 2 MB of memory, and opens a 55 MB file in
+about 70 ms.
 
 ## Install
 
@@ -21,18 +22,21 @@ Running it again updates in place, even while dvnote is open. Silent: add `--qui
 
 ## Compared with Windows Notepad
 
-Same machine, Windows 11 Notepad 11.2607.14.0, median of three runs, idle measured 10 s after the window settled.
+Same machine, Windows 11 Notepad 11.2607.14.0, idle measured 10 s after the window settled; the 55 MB file has 520,000
+ASCII lines. dvnote: 900×640 window, start the median of 11 runs, memory the median of 5.
 
 | | Notepad | dvnote |
 |---|---:|---:|
-| start, empty window | 467 ms | 106 ms |
-| start, 55 MB file | 3,095 ms | 141 ms |
+| start, empty window | 467 ms | 64 ms |
+| start, 55 MB file | 3,095 ms | 71 ms |
 | idle CPU, 55 MB file | 22.8% | 0.00% |
-| memory committed, empty | 96 MB | 6 MB |
-| memory committed, 55 MB file | 331 MB | 19 MB |
+| memory committed, empty | 96 MB | 2.1 MB |
+| memory committed, 55 MB file | 331 MB | 4.7 MB |
 
-Large files are memory-mapped and only the lines on screen are laid out; the document is a rope, so a keystroke takes
-under 0.1 ms up to 200 MB. Notepad has tabs, session restore and spell check; dvnote does not.
+Large files are memory-mapped and indexed in parallel; per-line bookkeeping stays sparse until lines are laid out, and
+only the lines on screen are. Text is shaped by DirectWrite and drawn into dvnote's own bitmap, with no Direct2D or
+Direct3D, and that bitmap is freed when the editor goes idle. Notepad has tabs, session restore and spell check; dvnote
+does not.
 
 ## Limits
 
