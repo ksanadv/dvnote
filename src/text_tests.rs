@@ -111,6 +111,40 @@ fn matches_a_rope_across_many_chunks() {
     assert_eq!(text.to_string(), expect.to_string());
 }
 
+// ASCII files skip the char table when every break is the same kind; a non-ASCII chunk or mixed breaks bring it back,
+// with the ASCII chunks' entries derived from their line starts
+#[test]
+fn ascii_and_mixed_chunks_match_a_rope() {
+    let build = |f: &dyn Fn(usize) -> String| (0..3000).map(f).collect::<String>();
+    let cases = [
+        ("ascii lf", build(&|i| format!("line {i} plain\n"))),
+        ("ascii crlf", build(&|i| format!("line {i} plain\r\n"))),
+        ("ascii mixed", build(&|i| format!("line {i}{}", if i % 7 == 0 { "\r\n" } else { "\n" }))),
+        ("one non-ascii line late", build(&|i| format!("line {i}{}\r\n", if i == 2900 { " é" } else { "" }))),
+        ("non-ascii early, ascii after", build(&|i| format!("{}{i}\n", if i < 10 { "😀" } else { "x" }))),
+    ];
+    for (name, s) in cases {
+        let (_f, m) = mapped(s.as_bytes());
+        let m = m.expect(name);
+        let formula = matches!(m.chars, CharIndex::Ascii { .. });
+        assert_eq!(formula, name.starts_with("ascii ") && name != "ascii mixed", "{name}");
+        let text = Text::Mapped(m);
+        let expect = Text::from_str(&s.replace("\r\n", "\n"));
+        assert_eq!(text.len_chars(), expect.len_chars(), "{name}");
+        assert_eq!(text.len_lines(), expect.len_lines(), "{name}");
+        for line in (0..expect.len_lines()).step_by(7).chain([expect.len_lines() - 1]) {
+            assert_eq!(text.line_to_char(line), expect.line_to_char(line), "{name} line {line}");
+            assert_eq!(text.line_len(line), expect.line_len(line), "{name} line {line}");
+            assert_eq!(text.line_text(line), expect.line_text(line), "{name} line {line}");
+        }
+        for i in (0..=expect.len_chars()).step_by(97).chain([expect.len_chars()]) {
+            assert_eq!(text.char_to_line(i), expect.char_to_line(i), "{name} char {i}");
+            assert_eq!(text.char_at(i.min(expect.len_chars() - 1)), expect.char_at(i.min(expect.len_chars() - 1)));
+        }
+        assert_eq!(text.to_string(), expect.to_string(), "{name}");
+    }
+}
+
 #[test]
 fn long_line_without_breaks() {
     let s = "ab😀".repeat(5000);

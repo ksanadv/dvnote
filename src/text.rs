@@ -174,9 +174,16 @@ pub struct Mapped {
     skip: usize,
     // byte offset of each line start, then the data length
     starts: Vec<u32>,
-    // char index of each line start, then the total
-    cum: Vec<u32>,
+    chars: CharIndex,
     crlf: bool,
+}
+
+// where each line starts in chars, and the total after the last line
+enum CharIndex {
+    Table(Vec<u32>),
+    // ASCII with one kind of line break: a line's char index is its byte offset less one per earlier "\r\n", so no
+    // table is needed
+    Ascii { crlf: bool },
 }
 
 fn count_chars(bytes: &[u8]) -> u32 {
@@ -185,16 +192,23 @@ fn count_chars(bytes: &[u8]) -> u32 {
 
 struct Chunk {
     starts: Vec<u32>,
+    // empty for an ASCII chunk, which does not need it unless the whole file turns out to
     cum: Vec<u32>,
     chars: u32,
+    ascii: bool,
+    breaks: u32,
+    crlfs: u32,
 }
 
 // Lines that begin inside `chunk`, which ends right after a '\n' (or at the end of the data). None if the chunk is not
 // valid UTF-8 or contains a '\r' that is not followed by '\n'.
 fn index_chunk(chunk: &[u8], last: bool) -> Option<Chunk> {
-    std::str::from_utf8(chunk).ok()?;
-    let (mut starts, mut cum) = (vec![0u32], vec![0u32]);
-    let (mut chars, mut pos) = (0u32, 0usize);
+    let ascii = chunk.is_ascii();
+    if !ascii {
+        std::str::from_utf8(chunk).ok()?;
+    }
+    let (mut starts, mut cum) = (vec![0u32], if ascii { Vec::new() } else { vec![0u32] });
+    let (mut chars, mut pos, mut breaks, mut crlfs) = (0u32, 0usize, 0u32, 0u32);
     while let Some(off) = chunk[pos..].iter().position(|&b| b == b'\n') {
         let end = pos + off;
         let seg = &chunk[pos..=end];
@@ -202,22 +216,41 @@ fn index_chunk(chunk: &[u8], last: bool) -> Option<Chunk> {
         if seg.iter().filter(|&&b| b == b'\r').count() != crlf as usize {
             return None;
         }
-        chars += count_chars(seg) - crlf as u32;
+        chars += if ascii { seg.len() as u32 } else { count_chars(seg) } - crlf as u32;
+        (breaks, crlfs) = (breaks + 1, crlfs + crlf as u32);
         pos = end + 1;
         starts.push(pos as u32);
-        cum.push(chars);
+        if !ascii {
+            cum.push(chars);
+        }
     }
     let tail = &chunk[pos..];
     if tail.contains(&b'\r') {
         return None;
     }
-    chars += count_chars(tail);
+    chars += if ascii { tail.len() as u32 } else { count_chars(tail) };
     if !last {
         // the line that starts at the chunk's end belongs to the next chunk
         starts.pop();
         cum.pop();
     }
-    Some(Chunk { starts, cum, chars })
+    Some(Chunk { starts, cum, chars, ascii, breaks, crlfs })
+}
+
+// the char index of each line start in an ASCII chunk, from its line starts: one char per byte, less the "\r" of each
+// earlier "\r\n"
+fn ascii_cum(chunk: &[u8], starts: &[u32]) -> Vec<u32> {
+    let mut crs = 0u32;
+    starts
+        .iter()
+        .enumerate()
+        .map(|(j, &s)| {
+            if j > 0 && s >= 2 && chunk[s as usize - 2] == b'\r' {
+                crs += 1;
+            }
+            s - crs
+        })
+        .collect()
 }
 
 fn is_fixed_drive(path: &Path) -> bool {
@@ -270,18 +303,38 @@ impl Mapped {
                 .collect();
             handles.into_iter().map(|h| h.join().ok().flatten()).collect()
         });
-        let (mut starts, mut cum) = (Vec::new(), Vec::new());
+        let parts: Vec<Chunk> = parts.into_iter().collect::<Option<_>>()?;
+        let (breaks, crlfs) = parts.iter().fold((0, 0), |(b, c), p| (b + p.breaks, c + p.crlfs));
+        let formula = parts.iter().all(|p| p.ascii) && (crlfs == 0 || crlfs == breaks);
+        let mut starts = Vec::with_capacity(breaks as usize + 2);
+        let mut cum = Vec::with_capacity(if formula { 0 } else { breaks as usize + 2 });
         let mut chars = 0u32;
         for (part, w) in parts.into_iter().zip(cuts.windows(2)) {
-            let part = part?;
+            if !formula {
+                let local = if part.ascii { ascii_cum(&data[w[0]..w[1]], &part.starts) } else { part.cum };
+                cum.extend(local.iter().map(|c| c + chars));
+            }
             starts.extend(part.starts.iter().map(|s| s + w[0] as u32));
-            cum.extend(part.cum.iter().map(|c| c + chars));
             chars += part.chars;
         }
         starts.push(data.len() as u32);
-        cum.push(chars);
         let crlf = starts.len() > 2 && starts[1] >= 2 && data[starts[1] as usize - 2] == b'\r';
-        Some(Mapped { map, _file: file, skip, starts, cum, crlf })
+        let chars = if formula {
+            CharIndex::Ascii { crlf: crlfs > 0 }
+        } else {
+            cum.push(chars);
+            CharIndex::Table(cum)
+        };
+        Some(Mapped { map, _file: file, skip, starts, chars, crlf })
+    }
+
+    // char index of line `i`'s start; `i == lines()` gives the total
+    fn char_of_line(&self, i: usize) -> usize {
+        match &self.chars {
+            CharIndex::Table(cum) => cum[i] as usize,
+            // every line but the last ends in a break
+            CharIndex::Ascii { crlf } => self.starts[i] as usize - *crlf as usize * i.min(self.lines() - 1),
+        }
     }
 
     pub fn has_bom(&self) -> bool {
@@ -307,25 +360,34 @@ impl Mapped {
     }
 
     pub fn total_chars(&self) -> usize {
-        *self.cum.last().unwrap() as usize
+        self.char_of_line(self.lines())
     }
 
     pub fn char_to_line(&self, idx: usize) -> usize {
         let idx = idx.min(self.total_chars());
-        let n = self.lines();
-        self.cum[..n].partition_point(|&c| c as usize <= idx).saturating_sub(1)
+        // the last line whose start is at or before idx
+        let (mut lo, mut hi) = (0, self.lines());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.char_of_line(mid) <= idx {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.saturating_sub(1)
     }
 
     pub fn line_to_char(&self, line: usize) -> usize {
-        self.cum[line.min(self.lines() - 1)] as usize
+        self.char_of_line(line.min(self.lines() - 1))
     }
 
     pub fn line_len(&self, line: usize) -> usize {
         let n = self.lines();
         if line + 1 < n {
-            (self.cum[line + 1] - self.cum[line]) as usize - 1
+            self.char_of_line(line + 1) - self.char_of_line(line) - 1
         } else {
-            (self.cum[n] - self.cum[line.min(n - 1)]) as usize
+            self.char_of_line(n) - self.char_of_line(line.min(n - 1))
         }
     }
 
@@ -353,7 +415,7 @@ impl Mapped {
             return self.data().len();
         }
         let line = self.char_to_line(idx);
-        let col = idx - self.cum[line] as usize;
+        let col = idx - self.char_of_line(line);
         let (s, e) = self.line_bytes(line);
         match self.str_range(s, e).char_indices().nth(col) {
             Some((b, _)) => s + b,
