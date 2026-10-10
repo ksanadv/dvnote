@@ -2,7 +2,7 @@
 
 A small Notepad-style editor for `.txt` and `.md` files, written in Rust on plain Win32 and DirectWrite.
 One 1.3 MB exe, no runtime, no admin rights. It idles at 0% CPU and about 2 MB of memory, and opens a 55 MB file in
-about 80 ms.
+about 70 ms.
 
 ## Install
 
@@ -27,11 +27,11 @@ ASCII lines. dvnote: 900×640 window, start the median of 11 runs, memory the me
 
 | | Notepad | dvnote |
 |---|---:|---:|
-| start, empty window | 467 ms | 61 ms |
-| start, 55 MB file | 3,095 ms | 78 ms |
+| start, empty window | 467 ms | 64 ms |
+| start, 55 MB file | 3,095 ms | 71 ms |
 | idle CPU, 55 MB file | 22.8% | 0.00% |
 | memory committed, empty | 96 MB | 2.1 MB |
-| memory committed, 55 MB file | 331 MB | 4.6 MB |
+| memory committed, 55 MB file | 331 MB | 4.7 MB |
 
 Large files are memory-mapped and indexed in parallel; per-line bookkeeping stays sparse until lines are laid out, and
 only the lines on screen are. Text is shaped by DirectWrite and drawn into dvnote's own bitmap, with no Direct2D or
