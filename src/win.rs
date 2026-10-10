@@ -1718,6 +1718,11 @@ fn trim_after_paint(hwnd: HWND) {
             windows::Win32::Graphics::Gdi::RDW_UPDATENOW | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
         );
     }
+    // the screen keeps what was painted; the back buffers are rebuilt by the next paint
+    with_app(|a| {
+        a.canvas.release();
+        a.preview.release_surface();
+    });
     trim_working_set();
     crate::trace::mark("idle trim");
     crate::trace::flush();
