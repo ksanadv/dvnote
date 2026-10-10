@@ -1720,6 +1720,7 @@ fn trim_after_paint(hwnd: HWND) {
     }
     trim_working_set();
     crate::trace::mark("idle trim");
+    crate::trace::flush();
 }
 
 // moves the process's resident pages to the standby list; they come back on demand, so an idle editor holds little RAM
@@ -2042,6 +2043,7 @@ pub fn run(pending: Option<(PathBuf, std::thread::JoinHandle<Result<doc::Loaded,
         let _ = SetFocus(Some(edit));
         SetTimer(Some(main), IDLE_TIMER, 6000, None);
         crate::trace::mark("shown");
+        crate::trace::flush();
 
         dialogs::register_messages();
         let accel = accelerators();
