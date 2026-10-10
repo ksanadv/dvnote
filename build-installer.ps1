@@ -11,7 +11,8 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $target = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
 $env:DVNOTE_EXE = Join-Path $target 'release\dvnote.exe'
 
-cargo build --release --manifest-path installer/Cargo.toml
+# the installer is its own workspace, so point it at the same target directory
+cargo build --release --manifest-path installer/Cargo.toml --target-dir $target
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 New-Item -ItemType Directory -Force dist | Out-Null
