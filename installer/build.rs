@@ -14,7 +14,7 @@ fn main() {
     }
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let manifest = std::fs::canonicalize("../assets/app.manifest").unwrap();
-    std::fs::write(out.join("icon.ico"), icon_art::ico(&[16, 32, 48, 256])).unwrap();
+    std::fs::write(out.join("icon.ico"), icon_art::ico(&[16, 20, 24, 32, 48, 64, 96, 256])).unwrap();
     // rc.exe wants forward slashes
     let fwd = |p: &std::path::Path| p.display().to_string().trim_start_matches(r"\\?\").replace('\\', "/");
     let rc = format!("1 ICON \"{}\"\n1 24 \"{}\"\n", fwd(&out.join("icon.ico")), fwd(&manifest));

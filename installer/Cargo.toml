@@ -8,9 +8,9 @@ description = "Installer for dvnote"
 [workspace]
 
 [dependencies]
-rfd = "0.17.2"
+dv-setup = { git = "https://github.com/ksanadv/dv-setup", tag = "v0.2.0" }
 winreg = "0.56.0"
-windows-sys = { version = "0.61.2", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 embed-resource = "3.0.12"
